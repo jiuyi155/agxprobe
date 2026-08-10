@@ -40,7 +40,7 @@ final class AGXStress {
         case renderPath   = "renderPath   (render draws + high-bit events)"
         case multiQueue   = "multiQueue   (32 queues, heavy submit)"
         case computeHeavy = "computeHeavy (GPU busy + many buffers)"
-        case chainedEvents= "chainedEvents (chain with high-bit values)"
+        case chainedEvents = "chainedEvents (chain with high-bit values)"
         case mixed        = "mixed        (everything at once)"
     }
 
