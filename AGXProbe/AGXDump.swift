@@ -126,8 +126,7 @@ enum AGXDump {
                     let o = Int(s.vm - minVM)
                     let n = Int(s.vs)
                     guard o + n <= Int(span), n > 0 else { continue }
-                    let src = base.advanced(by: o)
-                    dst.advanced(by: o).update(from: src.assumingMemoryBound(to: UInt8.self), count: n)
+                    memcpy(dst.advanced(by: o), base.advanced(by: o), n)
                 }
             }
 
