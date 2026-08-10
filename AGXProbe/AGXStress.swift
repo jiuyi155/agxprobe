@@ -214,7 +214,7 @@ final class AGXStress {
     private func floodStorm() {
         final class Counter { var inFlight = 0; var maxInFlight = 0 }
         let ring = 2048
-        let q = device.makeCommandQueue(maxCommandBufferCount: ring) ?? queue
+        let q = device.makeCommandQueue(maxCommandBufferCount: ring) ?? queue!
         // 32MB of blit per buffer: A15 copies ~100GB/s, so each buffer sticks
         // on the GPU ~a millisecond — enough for enqueue to outrun retire.
         let src = device.makeBuffer(length: 8 << 20, options: .storageModeShared)
