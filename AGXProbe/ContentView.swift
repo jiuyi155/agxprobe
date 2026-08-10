@@ -30,6 +30,15 @@ struct ContentView: View {
 
                 Button("Copy log") { model.copyLog() }
                     .font(.caption)
+
+                Button("DUMP AGX") { model.dumpAGX() }
+                    .font(.caption)
+                    .disabled(model.dumping)
+            }
+            if model.dumping {
+                Text("dumping… images may take ~30s, then find agx_dump/ in Files app")
+                    .font(.caption2)
+                    .foregroundColor(.orange)
             }
 
             ScrollView {
@@ -54,7 +63,8 @@ struct ContentView: View {
 @MainActor
 final class VM: ObservableObject {
     @Published var running = false
-    @Published var status = "idle — press START to drive AGX command queues"
+    @Published var dumping = false
+    @Published var status = "idle — press START to drive AGX command queues, or DUMP AGX to export userland binaries"
     @Published var log = ""
 
     private let stress = AGXStress()
@@ -90,5 +100,20 @@ final class VM: ObservableObject {
     func copyLog() {
         UIPasteboard.general.string = stress?.currentLog
         status = "log copied to clipboard"
+    }
+
+    func dumpAGX() {
+        guard !dumping else { return }
+        dumping = true
+        status = "DUMPING AGX userland binaries…"
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = AGXDump.run()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.log = result
+                self.dumping = false
+                self.status = "dump complete — Files app → AGXProbe → agx_dump/"
+            }
+        }
     }
 }

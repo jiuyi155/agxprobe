@@ -10,12 +10,14 @@
 		A30000000000000000000001 /* AGXProbeApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000001 /* AGXProbeApp.swift */; };
 		A30000000000000000000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000002 /* ContentView.swift */; };
 		A30000000000000000000003 /* AGXStress.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000003 /* AGXStress.swift */; };
+		A30000000000000000000004 /* AGXDump.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000004 /* AGXDump.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
 		A10000000000000000000001 /* AGXProbeApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AGXProbeApp.swift; sourceTree = "<group>"; };
 		A10000000000000000000002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		A10000000000000000000003 /* AGXStress.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AGXStress.swift; sourceTree = "<group>"; };
+		A10000000000000000000004 /* AGXDump.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AGXDump.swift; sourceTree = "<group>"; };
 		A10000000000000000000004 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A10000000000000000000005 /* AGXProbe.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AGXProbe.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -45,6 +47,7 @@
 				A10000000000000000000001 /* AGXProbeApp.swift */,
 				A10000000000000000000002 /* ContentView.swift */,
 				A10000000000000000000003 /* AGXStress.swift */,
+				A10000000000000000000004 /* AGXDump.swift */,
 				A10000000000000000000004 /* Info.plist */,
 			);
 			path = AGXProbe;
@@ -129,6 +132,7 @@
 				A30000000000000000000001 /* AGXProbeApp.swift in Sources */,
 				A30000000000000000000002 /* ContentView.swift in Sources */,
 				A30000000000000000000003 /* AGXStress.swift in Sources */,
+				A30000000000000000000004 /* AGXDump.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
