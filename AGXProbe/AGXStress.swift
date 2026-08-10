@@ -129,7 +129,11 @@ final class AGXStress {
     }
 
     var currentLog: String {
-        lock.lock(); defer { lock.unlock() }
+        // try() — never block the main thread on the worker. If the worker is
+        // stuck (GPU stall) we return the last known log instead of deadlocking
+        // the UI, which would trip the scene-update watchdog and SIGKILL us.
+        guard lock.try() else { return logBuffer }
+        defer { lock.unlock() }
         return logBuffer
     }
 
@@ -185,14 +189,16 @@ final class AGXStress {
 
     // MARK: - engines
 
-    /// Commit a command buffer that signals `event` to `value` then waits on
-    /// it; `work` optionally encodes a blit so the buffer is non-empty.
+    /// Commit a command buffer that signals `event` to `value`.  FIX: do NOT
+    /// encodeWaitForEvent on our own signal — IOGPU posts the shared-event
+    /// signal at command-buffer *completion*, so signal-then-wait-same-value
+    /// in one buffer self-deadlocks the GPU (event stays stale until the
+    /// buffer finishes, which the wait itself blocks). Removed.
     private func commitSignal(_ event: MTLSharedEvent, value: UInt64, queue q: MTLCommandQueue, blit: Bool) {
         guard let cb = q.makeCommandBuffer() else { return }
         cb.label = String(format: "sig-%llx", value)
         if blit { blitOn(cb, val: UInt32(value & 0xFFFF_FFFF)) }
         cb.encodeSignalEvent(event, value: value)
-        cb.encodeWaitForEvent(event, value: value) // wait for own signal
         cb.commit()
     }
 
@@ -300,7 +306,7 @@ final class AGXStress {
             enc.setRenderPipelineState(pipe)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             enc.endEncoding()
-            cb.encodeWaitForEvent(e, value: v)
+            // no encodeWaitForEvent on our own signal (same self-deadlock as commitSignal)
             cb.commit()
         }
         _ = waitAll()
@@ -375,10 +381,15 @@ final class AGXStress {
 
     private func waitAll() -> Bool {
         guard let barrier = queue.makeCommandBuffer() else { return false }
-        barrier.addCompletedHandler { _ in }
+        let sem = DispatchSemaphore(value: 0)
+        barrier.addCompletedHandler { _ in sem.signal() }
         barrier.commit()
-        barrier.waitUntilCompleted()
-        return barrier.status == .completed
+        let r = sem.wait(timeout: .now() + 8)
+        if r == .timedOut {
+            log("!!! GPU STALL — barrier did not complete in 8s (phase \(phase.rawValue))")
+            return false
+        }
+        return true
     }
 
     private func log(_ s: String) {
