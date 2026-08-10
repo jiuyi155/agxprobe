@@ -9,11 +9,22 @@
 //  of CVE-2026-64747: which IOConnectCallMethod feeds [queue+0x170]/[0x700]
 //  (the command-count bitmask the kernel slot-fill reads unchecked).
 //
-//  Output: <Documents>/agx_dump/<img>.bin — one file per matched image, bytes
-//  laid out as a rebased memory image (header at offset 0, each segment's
-//  payload at (vmaddr - imageMinVM)), plus <img>.txt with the meta (segment
-//  list, symtab offsets).  Retrievable via Files app (UIFileSharingEnabled)
-//  or i4Tools / 3uTools app-sandbox browser.
+//  Output: <Documents>/agx_dump/<img>.bin — one file per matched image, laid
+//  out as a COMPACT image (not a 1:1 VM image):
+//    * offset 0                 = Mach-O header + load commands (verbatim copy)
+//    * offset headerLen ..      = each segment's payload, back-to-back in
+//                                 load-command order, __PAGEZERO dropped
+//  The per-segment (name, original vmaddr, dump offset) map is written to
+//  <img>.txt so the PC-side analyzer can rebuild the virtual layout and
+//  resolve LC_SYMTAB (whose symoff is relative to the __LINKEDIT vmaddr).
+//
+//  Why compact: dyld-cache images have PAGEZERO at vmaddr 0 (vmsize up to
+//  GBs) and their segments are scattered across the cache's text/data/
+//  linkedit regions — a naive vmaddr-span image would be multi-GB of mostly
+//  zeros and OOM the app.
+//
+//  Retrievable via Files app (UIFileSharingEnabled) or i4Tools / 3uTools
+//  app-sandbox browser.
 //
 
 import Foundation
@@ -37,14 +48,14 @@ enum AGXDump {
     /// driver (AGXG14P), the Metal framework, the CoreMTL impl, IOKit and the
     /// IOGPU/AGXMetal userclients.
     static let wanted: [String] = [
-        "AGX",       // AGXG14P.bundle / AGXShared / AGXMetal
+        "AGX",       // AGXG14P.bundle / AGXShared / AGXMetalG14
         "Metal",     // Metal.framework
         "CoreMTL",
         "IOKit",
         "IOGPU",
     ]
 
-    static let maxSpan = 300 * 1024 * 1024  // safety cap on any single image
+    static let maxSpan = 700 * 1024 * 1024  // safety cap on any single image
 
     static func run() -> String {
         var out: [String] = []
@@ -75,15 +86,17 @@ enum AGXDump {
             let base = UnsafeRawPointer(h64)
             let ncmds = Int(h64.pointee.ncmds)
             let sizeofcmds = Int(h64.pointee.sizeofcmds)
+            let headerLen = MemoryLayout<mach_header_64>.size + sizeofcmds
             let lcStart = base.advanced(by: MemoryLayout<mach_header_64>.size)
 
-            var segs: [(name: String, vm: UInt64, vs: UInt64)] = []
-            var minVM = UInt64.max
-            var maxEnd: UInt64 = 0
-            var off = 0
+            // Collect non-PAGEZERO segments in load-command order.
+            struct SegInfo { var name: String; var vm: UInt64; var vs: UInt64 }
+            var segs: [SegInfo] = []
+            var imageBaseVM = UInt64.max
             var symtab: symtab_command? = nil
             var dysymtab: dysymtab_command? = nil
 
+            var off = 0
             while off < sizeofcmds {
                 let lc = lcStart.advanced(by: off).assumingMemoryBound(to: load_command.self)
                 let cmd = lc.pointee.cmd
@@ -93,15 +106,15 @@ enum AGXDump {
                     let seg = lcStart.advanced(by: off).assumingMemoryBound(to: segment_command_64.self)
                     let vm = seg.pointee.vmaddr
                     let vs = seg.pointee.vmsize
-                    if vs > 0 {
-                        minVM = min(minVM, vm)
-                        maxEnd = max(maxEnd, vm &+ vs)
-                        let sn = withUnsafeBytes(of: seg.pointee.segname) { p -> String in
-                            let c = p.baseAddress!.assumingMemoryBound(to: CChar.self)
-                            return String(cString: c)
-                        }
-                        segs.append((sn, vm, vs))
+                    let sn = withUnsafeBytes(of: seg.pointee.segname) { p -> String in
+                        let c = p.baseAddress!.assumingMemoryBound(to: CChar.self)
+                        return String(cString: c)
                     }
+                    // __PAGEZERO sits at vmaddr 0 with a huge vmsize in the
+                    // dyld-cache view; it has no loadable bytes. Drop it.
+                    if sn == "__PAGEZERO" || vs == 0 { off += cmdsz; continue }
+                    if vm < imageBaseVM { imageBaseVM = vm }
+                    segs.append(SegInfo(name: sn, vm: vm, vs: vs))
                 } else if cmd == UInt32(LC_SYMTAB) {
                     symtab = lcStart.advanced(by: off).assumingMemoryBound(to: symtab_command.self).pointee
                 } else if cmd == UInt32(LC_DYSYMTAB) {
@@ -110,28 +123,34 @@ enum AGXDump {
                 off += cmdsz
             }
 
-            guard minVM != UInt64.max, maxEnd > minVM else {
-                out.append("  skip \(name): no segments"); continue
-            }
-            let span = maxEnd - minVM
-            guard span <= maxSpan else {
-                out.append("  skip \(name): span \(span) > cap"); continue
+            guard !segs.isEmpty, imageBaseVM != UInt64.max else {
+                out.append("  skip \(name): no loadable segments"); continue
             }
 
-            // Build a rebased memory image: byte at (vm - minVM).
-            var buf = [UInt8](repeating: 0, count: Int(span))
+            // Compact layout: header+loadcmds, then each segment's bytes.
+            var total = headerLen
+            for s in segs { total += Int(s.vs) }
+            guard total <= maxSpan else {
+                out.append("  skip \(name): compact image \(total) > cap"); continue
+            }
+
+            var buf = [UInt8](repeating: 0, count: total)
             buf.withUnsafeMutableBytes { rb in
                 let dst = rb.baseAddress!
+                memcpy(dst, base, headerLen)
+                var p = headerLen
                 for s in segs {
-                    let o = Int(s.vm - minVM)
+                    let rel = Int(s.vm - imageBaseVM)      // offset from image base
                     let n = Int(s.vs)
-                    guard o + n <= Int(span), n > 0 else { continue }
-                    memcpy(dst.advanced(by: o), base.advanced(by: o), n)
+                    guard rel >= 0, rel + n <= Int(total - headerLen) + Int(s.vs) else { continue }
+                    // Segment bytes live at base + rel in this process's view.
+                    let src = base.advanced(by: rel)
+                    memcpy(dst.advanced(by: p), src, n)
+                    p += n
                 }
             }
 
             // Sanity: header magic at offset 0 must survive the copy.
-            guard buf.count >= 4 else { out.append("  FAIL \(name): too small"); continue }
             let magicCheck = UInt32(buf[0]) | (UInt32(buf[1]) << 8) | (UInt32(buf[2]) << 16) | (UInt32(buf[3]) << 24)
             if magicCheck != MH_MAGIC_64 {
                 out.append("  WARN \(name): header magic mismatch after copy")
@@ -145,9 +164,11 @@ enum AGXDump {
                 var lines = [String]()
                 lines.append("image: \(name)")
                 lines.append("slide: \(slide)")
-                lines.append("minVM: \(String(format: "%llx", minVM))  span: \(String(format: "%llx", span)) (\(span / 1024) KB)")
+                lines.append(String(format: "baseVM: %llx  headerLen: %d  total: %d", imageBaseVM, headerLen, total))
+                var p = headerLen
                 for s in segs {
-                    lines.append(String(format: "  %-16@ vm=%llx  sz=%llx", s.name, s.vm, s.vs))
+                    lines.append(String(format: "seg %@ vm=%llx vs=%llx off=%x", s.name, s.vm, s.vs, p))
+                    p += Int(s.vs)
                 }
                 if let st = symtab {
                     lines.append(String(format: "symtab: symoff=%u nsyms=%u stroff=%u strsize=%u", st.symoff, st.nsyms, st.stroff, st.strsize))
@@ -157,7 +178,7 @@ enum AGXDump {
                 }
                 try lines.joined(separator: "\n").write(to: metaURL, atomically: true, encoding: .utf8)
                 dumped += 1
-                out.append("DUMPED \(safeName).bin  \(span / 1024) KB  (\(segs.count) segs)")
+                out.append("DUMPED \(safeName).bin  \(total / 1024) KB  (\(segs.count) segs)")
             } catch {
                 out.append("  FAIL write \(safeName): \(error)")
             }
