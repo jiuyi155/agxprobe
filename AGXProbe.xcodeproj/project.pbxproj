@@ -18,7 +18,7 @@
 		A10000000000000000000002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 		A10000000000000000000003 /* AGXStress.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AGXStress.swift; sourceTree = "<group>"; };
 		A10000000000000000000004 /* AGXDump.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AGXDump.swift; sourceTree = "<group>"; };
-		A10000000000000000000004 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A10000000000000000000006 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A10000000000000000000005 /* AGXProbe.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = AGXProbe.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -48,7 +48,7 @@
 				A10000000000000000000002 /* ContentView.swift */,
 				A10000000000000000000003 /* AGXStress.swift */,
 				A10000000000000000000004 /* AGXDump.swift */,
-				A10000000000000000000004 /* Info.plist */,
+				A10000000000000000000006 /* Info.plist */,
 			);
 			path = AGXProbe;
 			sourceTree = "<group>";
