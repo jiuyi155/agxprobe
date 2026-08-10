@@ -36,7 +36,21 @@ severity:
 3. Nothing happens (count not controllable through these APIs → need a
    different trigger surface; report back the log).
 
-## Build (requires a Mac — any Mac, free Apple ID is fine)
+## Install — prebuilt ipa (CI-built, unsigned)
+
+A ready ipa is built automatically by GitHub Actions on every push and
+dropped into the **build artifacts** of the latest run
+(`AGXProbe.ipa`). It is **unsigned**, so install it with any free-Apple-ID
+sideloader:
+
+- **Windows**: [Sideloadly](https://sideloadly.io) (or AltStore).
+  Add the ipa, your Apple ID, click Start. The app installs for 7 days.
+- **macOS**: Sideloadly or Xcode (see Build below).
+
+The current ipa: bundle id `com.agxprobe.test`, arm64, MinOS 17.0.
+If a sideloader rejects the bundle id, re-sign with a unique id.
+
+## Build from source (requires a Mac — any Mac, free Apple ID is fine)
 
 1. Open `AGXProbe.xcodeproj` in Xcode (16.x).
 2. In the project → target **AGXProbe** → Signing & Capabilities:
