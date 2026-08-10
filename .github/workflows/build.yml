@@ -1,0 +1,33 @@
+name: build
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (unsigned, device arm64)
+        run: |
+          xcodebuild -project AGXProbe.xcodeproj -target AGXProbe \
+            -sdk iphoneos -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO build
+
+      - name: Package ipa
+        run: |
+          APP=$(find build -name "AGXProbe.app" -type d | head -1)
+          echo "packing $APP"
+          mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry AGXProbe.ipa Payload
+          ls -la AGXProbe.ipa
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: AGXProbe
+          path: AGXProbe.ipa
