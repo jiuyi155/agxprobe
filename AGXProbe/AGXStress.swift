@@ -110,11 +110,15 @@ final class AGXStress {
     // MARK: - control
 
     func start() {
-        lock.lock(); defer { lock.unlock() }
-        guard !running else { return }
+        lock.lock()
+        guard !running else { lock.unlock(); return }
         running = true
         phase = .floodStorm
         iterations = 0
+        lock.unlock()
+        // log() re-takes the lock; NSLock is non-reentrant, so it MUST run
+        // outside the lock scope or the main thread deadlocks here (observed:
+        // START button stuck, no log output, app appears frozen).
         log("=== AGXProbe START (device \(device.name)) ===")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             self?.runLoop()
@@ -122,8 +126,9 @@ final class AGXStress {
     }
 
     func stop() {
-        lock.lock(); defer { lock.unlock() }
+        lock.lock()
         running = false
+        lock.unlock()
         log("=== AGXProbe STOP ===")
     }
 
@@ -175,10 +180,11 @@ final class AGXStress {
     }
 
     private func advancePhase() {
-        lock.lock(); defer { lock.unlock() }
+        lock.lock()
         let all = Phase.allCases
         let idx = (all.firstIndex(of: phase)! + 1) % all.count
         phase = all[idx]
+        lock.unlock()
         log("--- phase -> \(phase.rawValue) ---")
     }
 
